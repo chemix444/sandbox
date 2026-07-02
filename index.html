@@ -25,6 +25,7 @@
     box-shadow:0 0 3px rgba(0,0,0,.8); }
   #crosshair::before{ width:14px; height:2px; left:-7px; top:-1px; }
   #crosshair::after{ width:2px; height:14px; left:-1px; top:-7px; }
+  #crosshair.on::before,#crosshair.on::after{ background:var(--accent); }
 
   #stats{ position:fixed; top:12px; left:12px; z-index:5; pointer-events:none;
     font-size:12px; color:var(--dim); text-shadow:0 1px 2px rgba(0,0,0,.8); line-height:1.6; }
@@ -101,7 +102,7 @@
   <b>Q</b> spawn menu · <b>1–4</b> tools · <b>V</b> noclip<br>
   <b>LMB</b> use tool (hold to carry) · <b>RMB</b> freeze / alt<br>
   <b>Wheel</b> hold distance · <b>Arrows</b> rotate held · <b>T</b> throw<br>
-  <b>F5</b> save world · <b>F9</b> load · <b>H</b> hide this
+  <b>Z</b> undo spawn · <b>F5</b> save · <b>F9</b> load · <b>H</b> hide this
 </div>
 
 <div id="toolbar">
@@ -124,6 +125,7 @@
       <div><b>LMB hold</b> grab prop</div><div><b>RMB</b> freeze prop</div>
       <div><b>Wheel</b> push / pull held</div><div><b>Arrow keys</b> rotate held</div>
       <div><b>T</b> throw held</div><div><b>V</b> noclip (C = down)</div>
+      <div><b>Z</b> undo last spawn</div><div><b>H</b> hide hints</div>
       <div><b>F5 / F9</b> save / load</div><div><b>Esc</b> pause</div>
     </div>
     <button class="bigbtn" id="playBtn">Click to play</button>
@@ -140,6 +142,8 @@
       <button data-t="plank">Plank<small>long board</small></button>
       <button data-t="ramp">Ramp<small>wedge, frozen</small></button>
       <button data-t="cylinder">Cylinder<small>barrel-ish</small></button>
+      <button data-t="cone">Cone<small>tips over nicely</small></button>
+      <button data-t="ball">Bouncy Ball<small>very bouncy</small></button>
       <button data-t="ragdoll">Ragdoll<small>11 parts, floppy</small></button>
     </div>
     <label><span class="name">Size</span><input type="range" id="sizeSlider" min="0.5" max="2.5" step="0.1" value="1"><span class="val" id="sizeVal">1.0</span></label>
@@ -155,7 +159,7 @@
 "use strict";
 
 /* ============================== constants ============================== */
-const MAX_PROPS   = 50;
+const MAX_PROPS   = 60;
 const EYE_HEIGHT  = 1.15;      // above player body center
 const PLAYER_R    = 0.5;
 const WALK_SPEED  = 6;
@@ -163,13 +167,17 @@ const SPRINT_MULT = 1.7;
 const JUMP_VEL    = 7.5;
 const FLY_SPEED   = 12;
 const GROUP_DEFAULT = 1;
-const GROUP_RAGDOLL = 2;
+// one group bit per live ragdoll: parts of the same ragdoll ignore each
+// other (keeps joints from jittering) but different ragdolls still collide.
+// 60 props / 11 parts caps live ragdolls at 5, so 5 bits suffice.
+const RAGDOLL_GROUPS = [2, 4, 8, 16, 32];
 
 const PALETTE = [0xe4572e,0x17bebb,0xffc914,0x76b041,0x8e6bbf,0xef476f,0x3d9be9,0xf28f3b];
 
 /* ============================== dom ============================== */
 const $ = id => document.getElementById(id);
 const startOverlay = $("start"), menuEl = $("menu"), msgEl = $("msg"), hintEl = $("hint");
+const crosshairEl = $("crosshair");
 const fpsEl = $("fps"), propCountEl = $("propCount"), modeLabel = $("modeLabel");
 $("propMax").textContent = MAX_PROPS;
 
@@ -247,6 +255,53 @@ const playerMat = new CANNON.Material("player");
 world.addContactMaterial(new CANNON.ContactMaterial(playerMat, worldMat,
   { friction: 0, restitution: 0 }));
 
+/* bouncy balls get their own restitution against everything */
+const bouncyMat = new CANNON.Material("bouncy");
+world.addContactMaterial(new CANNON.ContactMaterial(bouncyMat, worldMat,
+  { friction: 0.25, restitution: 0.85 }));
+world.addContactMaterial(new CANNON.ContactMaterial(bouncyMat, bouncyMat,
+  { friction: 0.2, restitution: 0.9 }));
+world.addContactMaterial(new CANNON.ContactMaterial(bouncyMat, playerMat,
+  { friction: 0, restitution: 0.4 }));
+
+/* ============================== audio ============================== */
+/* tiny procedural sounds — no assets, unlocked by the first click */
+let audioCtx = null;
+function ensureAudio(){
+  if(!audioCtx){
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(AC){ try{ audioCtx = new AC(); }catch(e){} }
+  }
+  if(audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+}
+
+let soundBudget = 6, budgetReset = 0;   // cap bursts so prop piles don't roar
+function playTone(freq, endFreq, vol, dur, type){
+  if(!audioCtx || audioCtx.state !== "running") return;
+  const now = performance.now();
+  if(now > budgetReset){ soundBudget = 6; budgetReset = now + 120; }
+  if(soundBudget-- <= 0) return;
+  const t = audioCtx.currentTime;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type || "triangle";
+  o.frequency.setValueAtTime(freq, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(endFreq, 1), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+
+function impactSound(body, speed){
+  const now = performance.now();
+  if(body._lastThump && now - body._lastThump < 90) return;
+  body._lastThump = now;
+  const vol = Math.min(0.18, (speed - 1.6) * 0.03);
+  if(vol <= 0.008) return;
+  const f = 240 - Math.min(body.mass, 40) * 3.5;  // heavier = deeper
+  playTone(f * (0.9 + Math.random() * 0.2), f * 0.55, vol, 0.11);
+}
+
 /* ============================== geometry helpers ============================== */
 function wedgeGeometry(hx, hy, hz){
   // triangular prism: flat bottom, vertical back at -z, slope down toward +z
@@ -299,9 +354,15 @@ function buildProp(type, dims, color){
   if(type === "cube" || type === "plank"){
     geo = new THREE.BoxGeometry(dims.x, dims.y, dims.z);
     shape = new CANNON.Box(new CANNON.Vec3(dims.x/2, dims.y/2, dims.z/2));
-  } else if(type === "sphere"){
+  } else if(type === "sphere" || type === "ball"){
     geo = new THREE.SphereGeometry(dims.r, 20, 14);
     shape = new CANNON.Sphere(dims.r);
+  } else if(type === "cone"){
+    // slightly truncated so the cannon hull keeps a real top face
+    geo = new THREE.CylinderGeometry(dims.r*0.18, dims.r, dims.h, 16);
+    shape = new CANNON.Cylinder(Math.max(dims.r*0.18, 0.05), dims.r, dims.h, 12);
+    shapeQuat = new CANNON.Quaternion();
+    shapeQuat.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2);
   } else if(type === "cylinder"){
     geo = new THREE.CylinderGeometry(dims.r, dims.r, dims.h, 16);
     shape = new CANNON.Cylinder(dims.r, dims.r, dims.h, 12);
@@ -321,11 +382,12 @@ function createProp(type, dims, mass, pos, quat, color, opts){
   const { geo, shape, shapeQuat } = buildProp(type, dims, color);
 
   const mesh = new THREE.Mesh(geo, makeMaterialFor(color));
+  if(type === "ball") mesh.material.roughness = 0.25;
   mesh.castShadow = true; mesh.receiveShadow = true;
   scene.add(mesh);
 
   const body = new CANNON.Body({ mass, position: new CANNON.Vec3(pos.x, pos.y, pos.z),
-                                 material: worldMat });
+                                 material: type === "ball" ? bouncyMat : worldMat });
   if(shapeQuat) body.addShape(shape, new CANNON.Vec3(), shapeQuat);
   else body.addShape(shape);
   if(quat) body.quaternion.set(quat.x, quat.y, quat.z, quat.w);
@@ -335,13 +397,20 @@ function createProp(type, dims, mass, pos, quat, color, opts){
   body.linearDamping = 0.01;
   body.angularDamping = 0.05;
   if(opts.ragdoll){
-    body.collisionFilterGroup = GROUP_RAGDOLL;
-    body.collisionFilterMask = GROUP_DEFAULT; // ragdoll parts ignore each other
+    body.collisionFilterGroup = opts.ragdoll;   // this ragdoll's group bit
+    body.collisionFilterMask = ~opts.ragdoll;   // hit everything but itself
   } else {
-    // cannon 0.6.2 defaults collisionFilterMask to 1, which excludes
-    // GROUP_RAGDOLL — ragdolls would fall straight through
+    // cannon 0.6.2 defaults collisionFilterMask to 1, which excludes the
+    // ragdoll group bits — ragdolls would fall straight through
     body.collisionFilterMask = -1;
   }
+  body._isProp = true;
+  body.addEventListener("collide", e => {
+    // prop-vs-prop fires on both bodies — let the lower id speak for the pair
+    if(e.body._isProp && body.id > e.body.id) return;
+    const v = e.contact ? Math.abs(e.contact.getImpactVelocityAlongNormal()) : 0;
+    if(v > 1.6) impactSound(body, v);
+  });
   world.addBody(body);
 
   const prop = { id: nextId++, type, dims, mass, color, body, mesh,
@@ -396,6 +465,24 @@ function setHighlight(prop, on){
 function updatePropCount(){ propCountEl.textContent = props.length; }
 
 function capacityLeft(){ return MAX_PROPS - props.length; }
+
+/* ---- undo: each menu spawn pushes one batch (a ragdoll is 11 props) ---- */
+const undoStack = [];
+function pushUndo(batch){
+  undoStack.push(batch);
+  if(undoStack.length > 40) undoStack.shift();
+}
+function undoLast(){
+  while(undoStack.length){
+    const batch = undoStack.pop().filter(p => props.includes(p));
+    if(!batch.length) continue;           // already deleted by other means
+    for(const p of batch) removeProp(p);
+    playTone(340, 90, 0.07, 0.12, "sawtooth");
+    msg(batch.length > 1 ? "undo (ragdoll)" : "undo");
+    return;
+  }
+  msg("nothing to undo");
+}
 
 /* ============================== map ============================== */
 const staticMat = c => new THREE.MeshStandardMaterial({ color:c, roughness:0.9, metalness:0 });
@@ -477,8 +564,7 @@ playerBody.allowSleep = false;
 playerBody.updateMassProperties();
 world.addBody(playerBody);
 
-let yaw = Math.PI, pitch = 0;    // face -z? spawn facing map center (toward -z from z=10)
-yaw = Math.PI; pitch = 0;
+let yaw = 0, pitch = 0;    // face -z: from the spawn at z=10, toward the map center
 let grounded = false;
 let noclip = false;
 
@@ -520,6 +606,7 @@ document.addEventListener("keydown", e => {
   if(e.code === "Digit3") setTool(3);
   if(e.code === "Digit4") setTool(4);
   if(e.code === "KeyH") hintEl.classList.toggle("hidden");
+  if(e.code === "KeyZ") undoLast();
   if(e.code === "KeyV") toggleNoclip();
   if(e.code === "KeyT" && carrying) throwCarried();
   if(e.code === "Space" && !noclip && grounded && locked)
@@ -528,6 +615,11 @@ document.addEventListener("keydown", e => {
   if(e.code === "F9") loadWorld();
 });
 document.addEventListener("keyup", e => { keys[e.code] = false; });
+
+/* keyup events are missed while the page is unfocused/unlocked — clear
+   held keys so the player doesn't keep walking on their own */
+function clearKeys(){ for(const k in keys) keys[k] = false; }
+addEventListener("blur", clearKeys);
 
 renderer.domElement.addEventListener("mousemove", e => {
   if(!locked) return;
@@ -553,7 +645,7 @@ addEventListener("wheel", e => {
 }, { passive:true });
 
 /* pointer lock plumbing */
-function requestLock(){ renderer.domElement.requestPointerLock(); }
+function requestLock(){ ensureAudio(); renderer.domElement.requestPointerLock(); }
 $("playBtn").addEventListener("click", requestLock);
 startOverlay.addEventListener("click", requestLock);
 
@@ -563,6 +655,7 @@ document.addEventListener("pointerlockchange", ()=>{
     startOverlay.classList.add("hidden");
   } else {
     if(carrying) releaseCarry(false);
+    clearKeys();
     if(!menuOpen) startOverlay.classList.remove("hidden");
   }
 });
@@ -599,6 +692,16 @@ function aimedProp(maxDist){
 let carrying = null;   // { prop, dist }
 let weldFirst = null;
 
+/* beam from the "muzzle" to the held prop */
+const beamGeo = new THREE.BufferGeometry();
+beamGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+const beam = new THREE.Line(beamGeo,
+  new THREE.LineBasicMaterial({ color:0x86c5ff, transparent:true, opacity:0.75 }));
+beam.visible = false;
+beam.frustumCulled = false;
+scene.add(beam);
+const _muzzle = new THREE.Vector3();
+
 function onPrimaryDown(){
   if(tool === 1){
     const hit = aimedProp(24);
@@ -608,6 +711,7 @@ function onPrimaryDown(){
     p.body.wakeUp();
     carrying = { prop: p, dist: Math.max(2.5, hit.dist) };
     setHighlight(p, true);
+    playTone(620, 880, 0.05, 0.07, "sine");
   }
   else if(tool === 2){
     fireForce();
@@ -632,7 +736,7 @@ function onPrimaryDown(){
   }
   else if(tool === 4){
     const hit = aimedProp(30);
-    if(hit){ removeProp(hit.prop); msg("deleted"); }
+    if(hit){ removeProp(hit.prop); playTone(300, 60, 0.08, 0.14, "sawtooth"); msg("deleted"); }
   }
 }
 
@@ -679,6 +783,7 @@ function releaseCarry(throwIt){
   }
   p.body.wakeUp();
   carrying = null;
+  beam.visible = false;
 }
 
 function throwCarried(){ releaseCarry(true); msg("yeet"); }
@@ -714,6 +819,13 @@ function updateCarry(){
                        keys["ArrowUp"] ? rot : -rot);
     q.mult(b.quaternion, b.quaternion);
   }
+
+  const bp = beamGeo.attributes.position.array;
+  _muzzle.set(0.3, -0.25, -0.5).applyMatrix4(camera.matrixWorld);
+  bp[0] = _muzzle.x; bp[1] = _muzzle.y; bp[2] = _muzzle.z;
+  bp[3] = b.position.x; bp[4] = b.position.y; bp[5] = b.position.z;
+  beamGeo.attributes.position.needsUpdate = true;
+  beam.visible = true;
 }
 
 /* --- force blaster --- */
@@ -789,6 +901,8 @@ function spawnFromMenu(type){
   else if(type === "plank"){  dims = {x:2.6*s, y:0.18*s, z:0.7*s};   lift = 0.2; }
   else if(type === "ramp"){   dims = {x:1.8*s, y:1.0*s, z:1.8*s};    lift = dims.y/2 + 0.02; }
   else if(type === "cylinder"){ dims = {r:0.38*s, h:1.25*s};         lift = dims.h/2 + 0.05; }
+  else if(type === "cone"){   dims = {r:0.55*s, h:1.1*s};            lift = dims.h/2 + 0.05; }
+  else if(type === "ball"){   dims = {r:0.45*s};                     lift = dims.r + 0.05; }
   const pos = spawnPoint(4.5, lift);
   // face the ramp's slope away from the player
   let quat = null;
@@ -796,7 +910,9 @@ function spawnFromMenu(type){
     const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), yaw + Math.PI);
     quat = { x:q.x, y:q.y, z:q.z, w:q.w };
   }
-  createProp(type, dims, m, pos, quat, color, { frozen: type === "ramp" });
+  const p = createProp(type, dims, m, pos, quat, color, { frozen: type === "ramp" });
+  pushUndo([p]);
+  playTone(520, 760, 0.06, 0.09, "sine");
   msg("spawned " + type + (type === "ramp" ? " (frozen)" : ""));
 }
 
@@ -806,10 +922,19 @@ function spawnRagdoll(){
   const base = spawnPoint(4.5, 1.45);
   const SKIN = 0xd9a066, SHIRT = 0x3d7ac2, PANTS = 0x37415c;
 
+  // pick a group bit no live ragdoll is using
+  let used = 0;
+  for(const p of props)
+    if(p.body.collisionFilterGroup !== GROUP_DEFAULT) used |= p.body.collisionFilterGroup;
+  const group = RAGDOLL_GROUPS.find(g => !(used & g)) || RAGDOLL_GROUPS[0];
+
+  const parts = [];
   function part(dx, dy, dz, ox, oy, mass, color){
-    return createProp("cube", {x:dx, y:dy, z:dz}, mass,
+    const p = createProp("cube", {x:dx, y:dy, z:dz}, mass,
       {x: base.x + ox, y: base.y + oy, z: base.z},
-      null, color, { ragdoll:true, noSave:true });
+      null, color, { ragdoll:group, noSave:true });
+    parts.push(p);
+    return p;
   }
 
   const pelvis = part(0.44, 0.24, 0.26,  0,    0,    3,   PANTS);
@@ -844,6 +969,8 @@ function spawnRagdoll(){
   joint(upLegL, loLegL, V(0,-0.21,0), V(0,0.21,0), 0.8, 0.15);    // knees
   joint(upLegR, loLegR, V(0,-0.21,0), V(0,0.21,0), 0.8, 0.15);
 
+  pushUndo(parts);
+  playTone(520, 760, 0.06, 0.09, "sine");
   msg("ragdoll spawned — try the force blaster on it");
 }
 
@@ -972,6 +1099,8 @@ function animate(){
 
   camera.rotation.set(pitch, yaw, 0);
   sky.position.copy(camera.position);
+
+  crosshairEl.classList.toggle("on", locked && !!(carrying || aimedProp(30)));
 
   for(let i = 0; i < props.length; i++){
     const p = props[i];
